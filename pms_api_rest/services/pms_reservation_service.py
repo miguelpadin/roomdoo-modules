@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 import pytz
 
 from odoo import SUPERUSER_ID, _, fields
-from odoo.exceptions import AccessError, MissingError
+from odoo.exceptions import AccessError, MissingError, ValidationError
+from odoo.http import content_disposition, request
 from odoo.osv import expression
 from odoo.tools.safe_eval import safe_eval
 
@@ -17,6 +18,10 @@ from odoo.addons.component.core import Component
 from odoo.addons.portal.controllers.portal import CustomerPortal
 
 from ..pms_api_rest_utils import pms_api_check_access, url_image_pms_api_rest
+
+# Cap for the guardian authorization upload. Generous for a scanned document,
+# small enough that a mistaken upload does not fill the filestore.
+MAX_MINORS_AUTHORIZATION_SIZE = 10 * 1024 * 1024
 
 
 def is_adult(birthdate):
@@ -797,6 +802,21 @@ class PmsReservationService(Component):
                         responsibleCheckinPartnerId=checkin_partner.ses_related_checkin_partner_id.id
                         if checkin_partner.ses_related_checkin_partner_id
                         else None,
+                        # The unaccompanied minors declaration and its
+                        # authorization belong to the folio, not to the guest:
+                        # the guardians may be booked in one reservation and the
+                        # minors in another one of the same folio. Every guest
+                        # reports the same value.
+                        unaccompaniedMinors=(
+                            checkin_partner.folio_id.ses_unaccompanied_minors
+                        ),
+                        allGuestsMinors=(
+                            checkin_partner.folio_id.ses_all_guests_minors
+                        ),
+                        minorsAuthorizationFilename=(
+                            checkin_partner.folio_id.ses_minors_authorization_filename
+                            or None
+                        ),
                     )
                 )
         return checkin_partners
@@ -829,6 +849,13 @@ class PmsReservationService(Component):
         if not checkin_partner:
             raise MissingError(_("Checkin partner not found"))
         pms_api_check_access(user=self.env.user, records=checkin_partner)
+        # Stored before the boarding branch below, which returns early: a
+        # request that declares the unaccompanied minors and boards the guest at
+        # once would otherwise lose the declaration and then be rejected for
+        # missing the relationship the declaration waives.
+        self._write_unaccompanied_minors(
+            checkin_partner, pms_checkin_partner_info.unaccompaniedMinors
+        )
         if (
             pms_checkin_partner_info.actionOnBoard
             and pms_checkin_partner_info.actionOnBoard is not None
@@ -1103,6 +1130,9 @@ class PmsReservationService(Component):
                     else False,
                 )
             )
+            self._write_unaccompanied_minors(
+                checkin_partner_last, pms_checkin_partner_info.unaccompaniedMinors
+            )
             return checkin_partner_last.id
         else:
             raise MissingError(
@@ -1207,6 +1237,155 @@ class PmsReservationService(Component):
                 }
             )
         return vals
+
+    def _write_unaccompanied_minors(self, checkin_partner, unaccompanied_minors):
+        """Store the unaccompanied minors declaration, which lives on the folio.
+
+        ``None`` means the field was not sent, and the declaration is left as it
+        was. This is not the usual mapping behaviour, where an absent field is
+        written as empty, and it cannot be: the declaration is folio wide, so
+        that would silently withdraw a declaration made through another guest on
+        every request that writes any other guest of the folio.
+        """
+        if unaccompanied_minors is None:
+            return
+        checkin_partner.folio_id.ses_unaccompanied_minors = unaccompanied_minors
+
+    def _get_reservation_checkin_partner(self, reservation_id, checkin_partner_id):
+        checkin_partner = (
+            self.env["pms.checkin.partner"]
+            .sudo()
+            .search(
+                [
+                    ("id", "=", checkin_partner_id),
+                    ("reservation_id", "=", reservation_id),
+                ]
+            )
+        )
+        if not checkin_partner:
+            raise MissingError(_("Checkin partner not found"))
+        pms_api_check_access(user=self.env.user, records=checkin_partner)
+        return checkin_partner
+
+    def _store_minors_authorization(self, checkin_partner, content, filename):
+        if not content:
+            raise ValidationError(_("The uploaded authorization is empty"))
+        if len(content) > MAX_MINORS_AUTHORIZATION_SIZE:
+            raise ValidationError(
+                _("The uploaded authorization is larger than %s MB")
+                % (MAX_MINORS_AUTHORIZATION_SIZE // (1024 * 1024))
+            )
+        checkin_partner.folio_id.write(
+            {
+                "ses_minors_authorization": base64.b64encode(content),
+                "ses_minors_authorization_filename": filename,
+            }
+        )
+
+    def _read_minors_authorization(self, checkin_partner):
+        folio = checkin_partner.folio_id
+        if not folio.ses_minors_authorization:
+            raise MissingError(_("There is no authorization stored"))
+        return (
+            base64.b64decode(folio.ses_minors_authorization),
+            folio.ses_minors_authorization_filename or "authorization",
+        )
+
+    @restapi.method(
+        [
+            (
+                [
+                    "/<int:reservation_id>/checkin-partners/"
+                    "<int:checkin_partner_id>/minors-authorization",
+                ],
+                "PUT",
+            )
+        ],
+        auth="jwt_api_pms",
+    )
+    def upload_minors_authorization(self, reservation_id, checkin_partner_id):
+        """Store the guardian authorization of the unaccompanied minors.
+
+        The document is uploaded as ``multipart/form-data`` under the ``file``
+        part, so a scanned document does not pay the base64 overhead of the
+        datamodel fields. It is read straight from the request because
+        ``restapi.MultipartFormData`` cannot be used: the base_rest dispatcher
+        leaves the uploaded files out of ``request.params``, so declaring the
+        parts would never reach them.
+
+        There is a single authorization per folio, whichever of its guests it is
+        uploaded through.
+        """
+        checkin_partner = self._get_reservation_checkin_partner(
+            reservation_id, checkin_partner_id
+        )
+        upload = request.httprequest.files.get("file")
+        if not upload:
+            raise ValidationError(
+                _("The authorization must be uploaded in the 'file' part")
+            )
+        self._store_minors_authorization(
+            checkin_partner, upload.read(), upload.filename
+        )
+        return checkin_partner.id
+
+    @restapi.method(
+        [
+            (
+                [
+                    "/<int:reservation_id>/checkin-partners/"
+                    "<int:checkin_partner_id>/minors-authorization",
+                ],
+                "GET",
+            )
+        ],
+        auth="jwt_api_pms",
+        output_param=restapi.BinaryData(),
+    )
+    def download_minors_authorization(self, reservation_id, checkin_partner_id):
+        """Download the stored guardian authorization of the unaccompanied minors."""
+        checkin_partner = self._get_reservation_checkin_partner(
+            reservation_id, checkin_partner_id
+        )
+        content, filename = self._read_minors_authorization(checkin_partner)
+        return request.make_response(
+            content,
+            headers=[
+                # Served as an opaque download and never inline: the file comes
+                # from whatever the establishment scanned, and letting the
+                # browser render it would turn an HTML or SVG upload into a
+                # script running on the API origin.
+                ("Content-Type", "application/octet-stream"),
+                ("X-Content-Type-Options", "nosniff"),
+                ("Content-Disposition", content_disposition(filename)),
+                ("Content-Length", len(content)),
+            ],
+        )
+
+    @restapi.method(
+        [
+            (
+                [
+                    "/<int:reservation_id>/checkin-partners/"
+                    "<int:checkin_partner_id>/minors-authorization",
+                ],
+                "DELETE",
+            )
+        ],
+        auth="jwt_api_pms",
+    )
+    def delete_minors_authorization(self, reservation_id, checkin_partner_id):
+        """Remove the stored guardian authorization of the unaccompanied minors."""
+        checkin_partner = self._get_reservation_checkin_partner(
+            reservation_id, checkin_partner_id
+        )
+        checkin_partner.folio_id.write(
+            {
+                "ses_minors_authorization": False,
+                "ses_minors_authorization_filename": False,
+            }
+        )
+        return checkin_partner.id
 
     @restapi.method(
         [
